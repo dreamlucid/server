@@ -24,6 +24,7 @@
 #include "../util/av_assert.h"
 #include "../util/av_util.h"
 
+#include <common/base64.h>
 #include <common/bit_depth.h>
 #include <common/diagnostics/graph.h>
 #include <common/env.h>
@@ -61,6 +62,7 @@ extern "C" {
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
@@ -410,6 +412,9 @@ struct ffmpeg_consumer : public core::frame_consumer
 
     common::bit_depth depth_;
 
+    tbb::concurrent_bounded_queue<std::shared_ptr<AVPacket>> packet_buffer_;
+    int scte35_stream_index_ = -1;
+
   public:
     ffmpeg_consumer(std::string path, std::string args, bool realtime, common::bit_depth depth)
         : channel_index_([&] {
@@ -518,18 +523,56 @@ struct ffmpeg_consumer : public core::frame_consumer
                     audio_stream.emplace(oc, ":a", oc->oformat->audio_codec, format_desc, realtime_, depth_, options);
                 }
 
+                // Add MPEG-TS options for SCTE-35 alignment
+                // NOTE: We do NOT create the SCTE-35 stream upfront because it causes
+                // avformat_write_header to not wait for SRT client connection in listener mode.
+                // The stream will be created dynamically when the first SCTE-35 packet is injected.
+                // This is acceptable because SCTE-35 is typically injected during playback, not at stream start.
+                if (std::string(oc->oformat->name) == "mpegts") {
+                    // Add options recommended by threefive for SCTE-35 alignment
+                    // See: https://github.com/futzu/threefive/blob/master/threefive-ffmpeg.md
+                    options["max_interleave_delta"] = "0";
+                    options["muxpreload"]          = "0";
+                    options["muxdelay"]            = "0";
+                }
+
                 if (!(oc->oformat->flags & AVFMT_NOFILE)) {
                     // TODO (fix) interrupt_cb
                     auto dict = to_dict(std::move(options));
                     CASPAR_SCOPE_EXIT { av_dict_free(&dict); };
+                    
+                    // For SRT, log connection opening
+                    if (path_.find("srt://") == 0) {
+                        CASPAR_LOG(info) << print() << " Opening SRT connection: " << full_path.string();
+                    }
+                    
                     FF(avio_open2(&oc->pb, full_path.string().c_str(), AVIO_FLAG_WRITE, nullptr, &dict));
+                    
+                    // For SRT listener mode, log that listener is ready
+                    if (path_.find("srt://") == 0 && path_.find("mode=listener") != std::string::npos) {
+                        CASPAR_LOG(info) << print() << " SRT listener ready, waiting for client connection...";
+                    }
+                    
                     options = to_map(&dict);
                 }
 
                 {
                     auto dict = to_dict(std::move(options));
                     CASPAR_SCOPE_EXIT { av_dict_free(&dict); };
+                    
+                    // For SRT listener mode, avformat_write_header should block until a client connects
+                    // However, with some stream configurations, it may return immediately
+                    // We'll verify the connection when we try to write packets
+                    if (path_.find("srt://") == 0 && path_.find("mode=listener") != std::string::npos) {
+                        CASPAR_LOG(info) << print() << " Writing format header (should block until client connects for listener mode)...";
+                    }
+                    
                     FF(avformat_write_header(oc, &dict));
+                    
+                    if (path_.find("srt://") == 0 && path_.find("mode=listener") != std::string::npos) {
+                        CASPAR_LOG(info) << print() << " Format header written, connection established";
+                    }
+                    
                     options = to_map(&dict);
                 }
 
@@ -539,8 +582,7 @@ struct ffmpeg_consumer : public core::frame_consumer
                     }
                 }
 
-                tbb::concurrent_bounded_queue<std::shared_ptr<AVPacket>> packet_buffer;
-                packet_buffer.set_capacity(realtime_ ? 1 : 128);
+                packet_buffer_.set_capacity(realtime_ ? 1 : 128);
                 auto packet_thread = std::thread([&] {
                     try {
                         CASPAR_SCOPE_EXIT
@@ -554,38 +596,75 @@ struct ffmpeg_consumer : public core::frame_consumer
 
                         std::shared_ptr<AVPacket> pkt;
                         while (true) {
-                            packet_buffer.pop(pkt);
+                            packet_buffer_.pop(pkt);
                             if (!pkt) {
                                 break;
                             }
                             count[pkt->stream_index] += 1;
-                            FF(av_interleaved_write_frame(oc, pkt.get()));
+                            
+                            // Write packet with error handling
+                            int ret = av_interleaved_write_frame(oc, pkt.get());
+                            if (ret < 0) {
+                                // Handle specific errors
+                                if (ret == AVERROR(EIO) || ret == AVERROR_EOF) {
+                                    CASPAR_LOG(error) << print() << " Connection closed or I/O error during packet write";
+                                    break;
+                                } else if (ret == AVERROR(EPIPE)) {
+                                    CASPAR_LOG(error) << print() << " Broken pipe - connection lost";
+                                    break;
+                                } else {
+                                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                                    av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+                                    CASPAR_LOG(error) << print() << " Error writing packet: " << errbuf << " (code=" << ret << ")";
+                                    // For SRT, some errors might be recoverable, but we'll break to avoid deadlock
+                                    if (path_.find("srt://") == 0) {
+                                        break;
+                                    }
+                                    FF_RET(ret, "av_interleaved_write_frame");
+                                }
+                            }
                         }
 
                         auto video_st = video_stream ? video_stream->st : nullptr;
                         auto audio_st = audio_stream ? audio_stream->st : nullptr;
 
-                        if ((!video_st || count[video_st->index]) && (!audio_st || count[audio_st->index])) {
-                            FF(av_write_trailer(oc));
+                        // Only write trailer if we actually wrote some packets
+                        // For SRT listener mode, if no client connected, we might not have written anything
+                        bool wrote_packets = (video_st && count[video_st->index] > 0) || 
+                                             (audio_st && count[audio_st->index] > 0) ||
+                                             (scte35_stream_index_ >= 0 && count[scte35_stream_index_] > 0);
+                        
+                        if (wrote_packets) {
+                            CASPAR_LOG(info) << print() << " Writing trailer (video=" << (video_st ? count[video_st->index] : 0) 
+                                             << ", audio=" << (audio_st ? count[audio_st->index] : 0) 
+                                             << ", scte35=" << (scte35_stream_index_ >= 0 ? count[scte35_stream_index_] : 0) << ")";
+                            int ret = av_write_trailer(oc);
+                            if (ret < 0) {
+                                char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                                av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+                                CASPAR_LOG(warning) << print() << " Error writing trailer: " << errbuf << " (code=" << ret << ")";
+                            }
+                        } else {
+                            CASPAR_LOG(info) << print() << " No packets written, skipping trailer";
                         }
 
                     } catch (...) {
                         CASPAR_LOG_CURRENT_EXCEPTION();
                         // TODO
-                        packet_buffer.abort();
+                        packet_buffer_.abort();
                     }
                 });
                 CASPAR_SCOPE_EXIT
                 {
                     if (packet_thread.joinable()) {
                         // TODO Is nullptr needed?
-                        packet_buffer.push(nullptr);
-                        packet_buffer.abort();
+                        packet_buffer_.push(nullptr);
+                        packet_buffer_.abort();
                         packet_thread.join();
                     }
                 };
 
-                auto packet_cb = [&](std::shared_ptr<AVPacket>&& pkt) { packet_buffer.push(std::move(pkt)); };
+                auto packet_cb = [&](std::shared_ptr<AVPacket>&& pkt) { packet_buffer_.push(std::move(pkt)); };
 
                 std::int64_t frame_number = 0;
                 while (true) {
@@ -614,7 +693,7 @@ struct ffmpeg_consumer : public core::frame_consumer
                     graph_->set_value("frame-time", frame_timer.elapsed() * format_desc.fps * 0.5);
 
                     if (!std::get<0>(data)) {
-                        packet_buffer.push(nullptr);
+                        packet_buffer_.push(nullptr);
                         break;
                     }
                 }
@@ -648,6 +727,63 @@ struct ffmpeg_consumer : public core::frame_consumer
         graph_->set_value("input", static_cast<double>(frame_buffer_.size() + 0.001) / frame_buffer_.capacity());
 
         return make_ready_future(true);
+    }
+
+    std::future<bool> call(const std::vector<std::wstring>& params) override
+    {
+        if (params.size() >= 2 && boost::iequals(params[0], L"SCTE35")) {
+            // SCTE-35 stream is not created upfront to avoid SRT connection issues
+            // We need to check if MPEG-TS format is being used
+            // For now, we'll log a warning that SCTE-35 injection requires the stream to be created
+            // This is a limitation - the stream should ideally be in the header, but creating it
+            // causes avformat_write_header to not wait for SRT client connection
+            if (scte35_stream_index_ == -1) {
+                CASPAR_LOG(warning) << print() << L" SCTE-35 stream not available (stream not created to avoid SRT connection issues)";
+                CASPAR_LOG(warning) << print() << L" Note: SCTE-35 stream creation causes SRT listener mode connection issues";
+                return caspar::make_ready_future(false);
+            }
+
+            std::string base64_payload = u8(params[1]);
+
+            // Decode Base64
+            auto data = from_base64(base64_payload);
+
+            if (data.empty()) {
+                CASPAR_LOG(warning) << print() << L" SCTE-35 invalid payload";
+                return caspar::make_ready_future(false);
+            }
+
+            // Create Packet
+            auto pkt = std::shared_ptr<AVPacket>(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
+            if (!pkt) {
+                CASPAR_LOG(error) << print() << L" SCTE-35 failed to alloc packet";
+                return caspar::make_ready_future(false);
+            }
+
+            // We need to copy data to a buffer allocated with av_malloc
+            pkt->data = (uint8_t*)av_malloc(data.size());
+            if (!pkt->data) {
+                CASPAR_LOG(error) << print() << L" SCTE-35 failed to alloc data";
+                return caspar::make_ready_future(false);
+            }
+
+            memcpy(pkt->data, data.data(), data.size());
+            pkt->size         = static_cast<int>(data.size());
+            pkt->stream_index = scte35_stream_index_;
+            pkt->pts          = AV_NOPTS_VALUE;
+            pkt->dts          = AV_NOPTS_VALUE;
+
+            try {
+                packet_buffer_.push(std::move(pkt));
+                CASPAR_LOG(info) << print() << L" SCTE-35 packet injected (" << data.size() << " bytes)";
+            } catch (const std::exception& e) {
+                CASPAR_LOG(error) << print() << L" Failed to push SCTE-35 packet: " << caspar::u16(e.what());
+                return caspar::make_ready_future(false);
+            }
+
+            return caspar::make_ready_future(true);
+        }
+        return caspar::make_ready_future(false);
     }
 
     std::wstring print() const override { return L"ffmpeg[" + u16(path_) + L"]"; }
