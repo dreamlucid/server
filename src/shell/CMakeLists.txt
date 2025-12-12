@@ -35,6 +35,13 @@ set_target_properties(casparcg PROPERTIES
         OUTPUT_NAME "${CASPARCG_BINARY_NAME}"
     )
 target_compile_features(casparcg PRIVATE cxx_std_17)
+# Set RPATH so the binary can find libraries in lib/ and CEF directory
+if (NOT MSVC)
+    set_target_properties(casparcg PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../lib:/usr/lib/casparcg-cef-131"
+        BUILD_WITH_INSTALL_RPATH TRUE
+    )
+endif()
 target_include_directories(casparcg PRIVATE
     ..
     ${BOOST_INCLUDE_PATH}
