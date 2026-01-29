@@ -187,6 +187,12 @@ class renderer_application
 #if __unix__
         if (getenv("DISPLAY") == nullptr) {
             command_line->AppendSwitchWithValue("ozone-platform", "headless");
+            // Headless GPU on Linux (e.g. NVIDIA) requires Vulkan feature and no surface (offscreen).
+            // See Chromium docs: server-side headless Linux Chrome with GPUs.
+            if (enable_gpu_) {
+                command_line->AppendSwitchWithValue("enable-features", "Vulkan");
+                command_line->AppendSwitch("disable-vulkan-surface");
+            }
         }
 #endif
 
@@ -197,10 +203,10 @@ class renderer_application
         command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
         command_line->AppendSwitchWithValue("remote-allow-origins", "*");
 
-        if (process_type.empty() && !enable_gpu_) {
-            // This gives more performance, but disabled gpu effects. Without it a single 1080p producer cannot be run
-            // smoothly
-
+        // When GPU is disabled, pass these to all processes (main, gpu, renderer). Otherwise only the
+        // main process gets them and subprocesses still try to init GPU, which can cause "Unable to get
+        // gpu adapter" and stack smashing on headless.
+        if (!enable_gpu_) {
             command_line->AppendSwitch("disable-gpu");
             command_line->AppendSwitch("disable-gpu-compositing");
             command_line->AppendSwitchWithValue("disable-gpu-vsync", "gpu");
@@ -238,6 +244,16 @@ void init(const core::module_dependencies& dependencies)
         settings.no_sandbox                   = true;
         settings.remote_debugging_port        = env::properties().get(L"configuration.html.remote-debugging-port", 0);
         settings.windowless_rendering_enabled = true;
+
+#if defined(__linux__)
+        // CEF on Linux requires an absolute path to the executable for subprocess spawning.
+        try {
+            auto exe_path = boost::filesystem::read_symlink("/proc/self/exe");
+            CefString(&settings.browser_subprocess_path).FromString(exe_path.string());
+        } catch (...) {
+            // If we can't resolve /proc/self/exe, CEF will use argv[0]; run.sh uses absolute path.
+        }
+#endif
 
         auto cache_path = env::properties().get(L"configuration.html.cache-path", L"cef-cache");
         if (!cache_path.empty()) {

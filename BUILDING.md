@@ -101,3 +101,107 @@ If all goes to plan, a folder called 'staging' has been created with everything 
 -DDIAG_FONT_PATH - Specify an alternate path/font to use for the DIAG window. On linux, this will often want to be set to an absolute path of a font
 
 -DCASPARCG_BINARY_NAME=casparcg-server - (Linux only) generate the executable with the specified name. This also reconfigures the install target to be a bit more friendly with system package managers.
+
+## Troubleshooting: Segmentation fault when running (Linux with CEF)
+
+If `./run.sh` or `bin/casparcg` exits immediately with **Segmentation fault (core dumped)**, the cause is almost always CEF (Chromium Embedded Framework) not being available or compatible.
+
+- **Why it happens:** With `ENABLE_HTML=ON` (default), the HTML module is linked and CEF is invoked at the very start of `main()` via `CefExecuteProcess()`. If the CEF library is missing, wrong version, or incompatible (e.g. different ABI), or if the executable is run with a **relative** `argv[0]` (e.g. `bin/casparcg`), the process can segfault before any log output.
+
+- **run.sh** is set up to launch the binary with an **absolute path** so CEF on Linux sees a proper executable path; always use `./run.sh` from the staging folder rather than calling `bin/casparcg` directly with a relative path.
+
+**Fix A – Use system CEF (recommended):**
+
+1. Add the CasparCG PPA and install the CEF package used by the build:
+   ```bash
+   sudo add-apt-repository ppa:casparcg/ppa
+   sudo apt-get update
+   sudo apt-get install casparcg-cef-142-dev
+   ```
+2. Rebuild and install:
+   ```bash
+   cd build
+   cmake ../src
+   cmake --build . --parallel
+   cmake --install . --prefix staging
+   ```
+3. Run from the staging folder: `cd staging && ./run.sh`
+
+**Fix B – Use bundled CEF (no PPA):**
+
+1. Configure with system CEF disabled so CMake downloads and builds CEF:
+   ```bash
+   cd build
+   cmake ../src -DUSE_SYSTEM_CEF=OFF
+   cmake --build . --parallel
+   cmake --install . --prefix staging
+   ```
+2. The first build will download CEF (large) and compile it; install will put CEF libraries and resources under `staging/lib/`. Run with: `cd staging && ./run.sh` (run.sh sets `LD_LIBRARY_PATH=lib` so the bundled CEF is found).
+
+**If segfault persists after system CEF and run.sh:**
+
+1. **Get a backtrace** to see where it crashes:
+   ```bash
+   cd staging
+   LD_LIBRARY_PATH=lib gdb -batch -ex "run" -ex "bt full" -ex "x/i \$pc" -ex "info registers" -ex "quit" --args ./bin/casparcg
+   ```
+   Or interactively: `LD_LIBRARY_PATH=lib gdb --args ./bin/casparcg`, then in GDB: `run`, then after the segfault: `bt`, `x/i $pc`, `info registers`.
+
+   If the crash is in `CefExecuteProcess` with `mov (%rdi),%rax` and `%rdi` holds an invalid address (e.g. `0x63ce...`), the cause is usually **Clang vs GCC ABI**: the system CEF package’s `libcef_dll_wrapper.a` is built with GCC; when CasparCG is built with Clang, the `scoped_refptr<CefApp>` is passed incorrectly and the wrapper dereferences a garbage pointer. **Fix: build CasparCG with GCC** (see step 3).
+
+2. **Headless / no display:** On servers (e.g. GCP) without X11, CEF may still crash during early init. Try:
+   ```bash
+   DISPLAY=:0 ./run.sh   # if you have a display
+   # or install xvfb and run: xvfb-run ./run.sh
+   ```
+
+3. **Compiler ABI (recommended if backtrace shows CefExecuteProcess + bad %rdi):** Build CasparCG with the same compiler used by the system CEF package (GCC):
+   ```bash
+   cd build
+   rm -rf *   # clean so compiler change takes effect
+   cmake ../src -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+   cmake --build . --parallel
+   cmake --install . --prefix staging
+   cd staging && ./run.sh
+   ```
+
+**CEF log messages when running headless (no display):**
+
+- **UPower / org.freedesktop.DBus** – CEF querying power/display over D-Bus. Harmless on headless (no UPower). Safe to ignore.
+- **DEPRECATED_ENDPOINT** – Chromium’s GCM using a deprecated Google API. Harmless. Safe to ignore.
+- **Unable to get gpu adapter** – When GPU is disabled, expected on headless. When GPU is enabled, see “Using GPU headless (NVIDIA)” below.
+- **Stack smashing detected ***: terminated** – Serious: a CEF subprocess (e.g. GPU process) crashed. The code now passes `disable-gpu` to all CEF processes when GPU is disabled, which should avoid this on headless. If it still happens, run with `configuration.html.enable-gpu` set to `false` and rebuild; report the issue if it persists.
+
+**Using GPU headless (e.g. NVIDIA):**
+
+To use an NVIDIA GPU for CEF/HTML when there is no display (headless server):
+
+- **Vulkan vs OpenGL:** CasparCG’s HTML templates use **WebGL (OpenGL)** as before. On headless Linux, Chromium/CEF cannot use OpenGL/EGL without an X11 display (it fails). So we use **Vulkan only as the low-level backend** for CEF to talk to the GPU when there is no display; WebGL in your templates still runs on the GPU via ANGLE. You do not need to change templates or “support Vulkan” in your app—only the system needs Vulkan libraries and the NVIDIA Vulkan driver.
+
+1. **System:** Install NVIDIA driver (you have it) and Vulkan libraries + ICD so CEF can use the GPU:
+   ```bash
+   nvidia-smi   # confirm driver (you already have this)
+   sudo apt install -y libvulkan1 vulkan-tools
+   vulkaninfo --summary   # should list your NVIDIA GPU
+   ```
+   If `vulkaninfo` does not show an NVIDIA device, install the NVIDIA Vulkan ICD if needed (e.g. `libnvidia-gl-<version>` matching your driver; on many setups the driver already provides Vulkan).
+
+2. **Config:** In `casparcg.config`, enable GPU for the HTML module:
+   ```xml
+   <html>
+     <enable-gpu>true</enable-gpu>
+     <angle-backend>vulkan</angle-backend>
+     ...
+   </html>
+   ```
+
+3. **Behaviour:** When `DISPLAY` is unset and `enable-gpu` is true, CasparCG passes `--use-angle=vulkan`, `--enable-features=Vulkan`, and `--disable-vulkan-surface` to CEF so it uses the GPU headless (per [Chromium server-side headless GPU docs](https://chromium.googlesource.com/chromium/src/+/main/docs/gpu/using-gpu-hardware-in-headless-chrome.md)). If you still see “Unable to get gpu adapter” or crashes, try `enable-gpu` false (software rendering) or ensure Vulkan works (`vulkaninfo --summary`).
+
+**Build without CEF (no HTML module):**
+
+To run CasparCG without the HTML/CEF module at all (e.g. to confirm the rest of the app works):
+
+```bash
+cmake ../src -DENABLE_HTML=OFF
+```
+Then build and install as above. The HTML producer will not be available.
